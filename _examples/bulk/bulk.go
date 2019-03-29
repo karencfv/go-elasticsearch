@@ -33,6 +33,25 @@ type Author struct {
 func main() {
 	log.SetFlags(0)
 
+	type bulkResponse struct {
+		Errors bool `json:"errors"`
+		Items  []struct {
+			Index struct {
+				ID     string `json:"_id"`
+				Result string `json:"result"`
+				Status int    `json:"status"`
+				Error  struct {
+					Type   string `json:"type"`
+					Reason string `json:"reason"`
+					Cause  struct {
+						Type   string `json:"type"`
+						Reason string `json:"reason"`
+					} `json:"caused_by"`
+				} `json:"error"`
+			} `json:"index"`
+		} `json:"items"`
+	}
+
 	var (
 		_     = fmt.Print
 		count = 1000
@@ -40,17 +59,17 @@ func main() {
 
 		buf bytes.Buffer
 		res *esapi.Response
-		ers map[string]interface{}
 		err error
+		raw map[string]interface{}
+		blk *bulkResponse
 
 		articles   []*Article
 		indexName  = "articles"
+		numItems   int
 		numErrors  int
 		numIndexed int
 		currBatch  int
 	)
-
-	type bulkErrorResponse struct{}
 
 	es, err := elasticsearch.NewDefaultClient()
 	if err != nil {
@@ -71,7 +90,7 @@ func main() {
 			},
 		})
 	}
-	log.Printf("Generated %d articles", len(articles))
+	log.Printf("> Generated %d articles", len(articles))
 
 	// Re-create the index
 	//
@@ -93,6 +112,8 @@ func main() {
 	// Start looping over collection
 	//
 	for i, a := range articles {
+		numItems++
+
 		currBatch = i / batch
 		if i == count-1 {
 			currBatch++
@@ -115,9 +136,9 @@ func main() {
 		// fmt.Printf("%s", data) // <-- Uncomment to see the payload
 
 		// // Uncomment next block to trigger indexing errors -->
-		if a.ID == 11 || a.ID == 101 {
-			data = []byte(`{"published" : "INCORRECT"}` + "\n")
-		}
+		// if a.ID == 11 || a.ID == 101 {
+		// 	data = []byte(`{"published" : "INCORRECT"}` + "\n")
+		// }
 
 		// Append meta data and payload to the buffer (ignoring write errors)
 		//
@@ -128,53 +149,49 @@ func main() {
 		// When a threshold is reached, execute the Bulk() request with body from buffer
 		//
 		if i > 0 && i%batch == 0 || i == count-1 {
-			log.Printf("Batch %-2d of %d", currBatch, (count/batch)+1)
+			log.Printf("> Batch %-2d of %d", currBatch, (count/batch)+1)
 
-			res, err := es.Bulk(bytes.NewReader(buf.Bytes()), es.Bulk.WithIndex(indexName))
+			res, err = es.Bulk(bytes.NewReader(buf.Bytes()), es.Bulk.WithIndex(indexName))
 			if err != nil {
 				log.Fatalf("Failure indexing batch %d: %s", currBatch, err)
 			}
 			// If the whole request failed, print error
 			if res.IsError() {
-				numErrors += batch
-				if err := json.NewDecoder(res.Body).Decode(&ers); err != nil {
+				numErrors += numItems
+				if err := json.NewDecoder(res.Body).Decode(&raw); err != nil {
 					log.Fatalf("Failure to to parse response body: %s", err)
 				} else {
-					log.Printf("Error: [%d] %s: %s",
+					log.Printf("  Error: [%d] %s: %s",
 						res.StatusCode,
-						ers["error"].(map[string]interface{})["type"],
-						ers["error"].(map[string]interface{})["reason"],
+						raw["error"].(map[string]interface{})["type"],
+						raw["error"].(map[string]interface{})["reason"],
 					)
 				}
 				// A successful response might still contain errors for particular documents.
 			} else {
-				if err := json.NewDecoder(res.Body).Decode(&ers); err != nil {
+				if err := json.NewDecoder(res.Body).Decode(&blk); err != nil {
 					log.Fatalf("Failure to to parse response body: %s", err)
 				} else {
-					// Print the response status and error information.
-					if _, ok := ers["errors"].(bool); ok {
-						for _, d := range ers["items"].([]interface{}) {
-							docID := d.(map[string]interface{})["index"].(map[string]interface{})["_id"]
-							status := d.(map[string]interface{})["index"].(map[string]interface{})["status"].(float64)
+					for _, d := range blk.Items {
+						if d.Index.Status > 201 {
+							numErrors++
 
-							if status > 201 {
-								numErrors++
-
-								reason := d.(map[string]interface{})["index"].(map[string]interface{})["error"].(map[string]interface{})["caused_by"].(map[string]interface{})["caused_by"].(map[string]interface{})["reason"]
-
-								log.Printf("Error: documentID=%-3s [%.0f]: %s",
-									docID,
-									status,
-									reason,
-								)
-							} else {
-								numIndexed++
-							}
+							// Print the response status and error information.
+							log.Printf("  Error: [%d]: %s: %s: %s: %s",
+								d.Index.Status,
+								d.Index.Error.Type,
+								d.Index.Error.Reason,
+								d.Index.Error.Cause.Type,
+								d.Index.Error.Cause.Reason,
+							)
+						} else {
+							numIndexed++
 						}
 					}
 				}
 			}
 			buf.Reset()
+			numItems = 0
 		}
 	}
 

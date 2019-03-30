@@ -1,7 +1,16 @@
 // +build ignore
 
-// This example demonstrates indexing how to index documents using the
-// Bulk API [https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-bulk.html].
+// This example demonstrates indexing documents using the Elasticsearch "Bulk" API
+// [https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-bulk.html].
+//
+// You can configure the number of documents and the batch size with command line flags:
+//
+//     go run bulk.go -count=10000 -batch=2500
+//
+// The example intentionally doesn't use any abstractions or helper functions, to
+// demonstrate the low-level mechanics of working with the Bulk API: preparing
+// the meta+data payloads, sending the payloads in batches,
+// inspecting the error results, and printing a report.
 //
 //
 package main
@@ -12,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"strconv"
 	"strings"
 	"time"
@@ -41,8 +51,10 @@ var (
 
 func init() {
 	flag.IntVar(&count, "count", 1000, "Number of documents to generate")
-	flag.IntVar(&batch, "batch", 75, "Number of documents to send in one batch")
+	flag.IntVar(&batch, "batch", 255, "Number of documents to send in one batch")
 	flag.Parse()
+
+	rand.Seed(time.Now().UnixNano())
 }
 
 func main() {
@@ -80,10 +92,12 @@ func main() {
 		numItems   int
 		numErrors  int
 		numIndexed int
-		currBatch  int
 		numBatches int
+		currBatch  int
 	)
 
+	// Create the Elasticsearch client
+	//
 	es, err := elasticsearch.NewDefaultClient()
 	if err != nil {
 		log.Fatalf("Error creating the client: %s", err)
@@ -91,14 +105,15 @@ func main() {
 
 	// Generate the articles collection
 	//
+	names := []string{"Alice", "John", "Mary"}
 	for i := 1; i < count+1; i++ {
 		articles = append(articles, &Article{
 			ID:        i,
 			Title:     strings.Join([]string{"Title", strconv.Itoa(i)}, " "),
-			Body:      "Lorem ipsum...",
-			Published: time.Now().AddDate(0, 0, i),
+			Body:      "Lorem ipsum dolor sit amet...",
+			Published: time.Now().UTC().AddDate(0, 0, i),
 			Author: Author{
-				FirstName: "John",
+				FirstName: names[rand.Intn(len(names))],
 				LastName:  "Smith",
 			},
 		})
@@ -107,11 +122,7 @@ func main() {
 
 	// Re-create the index
 	//
-	if _, err = es.Indices.Delete([]string{indexName}); err != nil {
-		log.Fatalf("Cannot delete index: %s", err)
-	}
-	res, err = es.Indices.Delete([]string{indexName})
-	if err != nil {
+	if res, err = es.Indices.Delete([]string{indexName}); err != nil {
 		log.Fatalf("Cannot delete index: %s", err)
 	}
 	res, err = es.Indices.Create(indexName)
@@ -130,7 +141,7 @@ func main() {
 
 	start := time.Now().UTC()
 
-	// Start looping over collection
+	// Loop over the collection
 	//
 	for i, a := range articles {
 		numItems++
@@ -140,19 +151,20 @@ func main() {
 			currBatch++
 		}
 
-		// Prepare meta data
+		// Prepare the metadata payload
 		//
 		meta := []byte(fmt.Sprintf(`{ "index" : { "_index" : "%s", "_id" : "%d" } }%s`, indexName, a.ID, "\n"))
 		// fmt.Printf("%s", meta) // <-- Uncomment to see the payload
 
-		// Encode article to JSON
+		// Prepare the data payload: encode article to JSON
 		//
 		data, err := json.Marshal(a)
 		if err != nil {
 			log.Fatalf("Cannot encode article %d: %s", a.ID, err)
 		}
 
-		// Append newline to JSON payload
+		// Append newline to the data payload
+		//
 		data = append(data, "\n"...) // <-- Comment out to trigger failure for batch
 		// fmt.Printf("%s", data) // <-- Uncomment to see the payload
 
@@ -160,8 +172,9 @@ func main() {
 		// if a.ID == 11 || a.ID == 101 {
 		// 	data = []byte(`{"published" : "INCORRECT"}` + "\n")
 		// }
+		// // <--------------------------------------------------
 
-		// Append meta data and payload to the buffer (ignoring write errors)
+		// Append payloads to the buffer (ignoring write errors)
 		//
 		buf.Grow(len(meta) + len(data))
 		buf.Write(meta)
@@ -176,7 +189,8 @@ func main() {
 			if err != nil {
 				log.Fatalf("Failure indexing batch %d: %s", currBatch, err)
 			}
-			// If the whole request failed, print error
+			// If the whole request failed, print error and mark all documents as failed
+			//
 			if res.IsError() {
 				numErrors += numItems
 				if err := json.NewDecoder(res.Body).Decode(&raw); err != nil {
@@ -188,16 +202,21 @@ func main() {
 						raw["error"].(map[string]interface{})["reason"],
 					)
 				}
-				// A successful response might still contain errors for particular documents.
+				// A successful response might still contain errors for particular documents...
+				//
 			} else {
 				if err := json.NewDecoder(res.Body).Decode(&blk); err != nil {
 					log.Fatalf("Failure to to parse response body: %s", err)
 				} else {
 					for _, d := range blk.Items {
+						// ... so for any HTTP status above 201 ...
+						//
 						if d.Index.Status > 201 {
+							// ... increment the error counter ...
+							//
 							numErrors++
 
-							// Print the response status and error information.
+							// ... and print the response status and error information ...
 							log.Printf("  Error: [%d]: %s: %s: %s: %s",
 								d.Index.Status,
 								d.Index.Error.Type,
@@ -206,35 +225,40 @@ func main() {
 								d.Index.Error.Cause.Reason,
 							)
 						} else {
+							// ... otherwise increase the success counter.
+							//
 							numIndexed++
 						}
 					}
 				}
 			}
+			// Reset the buffer and items counter
+			//
 			buf.Reset()
 			numItems = 0
 		}
 	}
 
+	// Report the results: number of indexed docs, number of errors, duration, indexing rate
+	//
 	log.Println(strings.Repeat("=", 80))
 
 	dur := time.Since(start)
 
-	// Report results: number of indexed docs, number of errors, duration
 	if numErrors > 0 {
 		log.Fatalf(
 			"Indexed [%d] documents with [%d] errors in %s (%.0f docs/sec)",
 			numIndexed,
 			numErrors,
 			dur.Truncate(time.Millisecond),
-			1000.0/float64(int64(dur)/int64(time.Millisecond))*float64(numIndexed),
+			1000.0/float64(dur/time.Millisecond)*float64(numIndexed),
 		)
 	} else {
 		log.Printf(
 			"Sucessfuly indexed [%d] documents in %s (%.0f docs/sec)",
 			numIndexed,
 			dur.Truncate(time.Millisecond),
-			1000.0/float64(int64(dur)/int64(time.Millisecond))*float64(numIndexed),
+			1000.0/float64(dur/time.Millisecond)*float64(numIndexed),
 		)
 	}
 }

@@ -1,12 +1,15 @@
 // +build ignore
 
-// This example demonstrates indexing data in bulk.
+// This example demonstrates indexing how to index documents using the
+// Bulk API [https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-bulk.html].
+//
 //
 package main
 
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"strconv"
@@ -28,6 +31,18 @@ type Article struct {
 type Author struct {
 	FirstName string `json:"first_name"`
 	LastName  string `json:"last_name"`
+}
+
+var (
+	_     = fmt.Print
+	count int
+	batch int
+)
+
+func init() {
+	flag.IntVar(&count, "count", 1000, "Number of documents to generate")
+	flag.IntVar(&batch, "batch", 75, "Number of documents to send in one batch")
+	flag.Parse()
 }
 
 func main() {
@@ -53,22 +68,20 @@ func main() {
 	}
 
 	var (
-		_     = fmt.Print
-		count = 1000
-		batch = 75
-
 		buf bytes.Buffer
 		res *esapi.Response
 		err error
 		raw map[string]interface{}
 		blk *bulkResponse
 
-		articles   []*Article
-		indexName  = "articles"
+		articles  []*Article
+		indexName = "articles"
+
 		numItems   int
 		numErrors  int
 		numIndexed int
 		currBatch  int
+		numBatches int
 	)
 
 	es, err := elasticsearch.NewDefaultClient()
@@ -108,6 +121,14 @@ func main() {
 	if res.IsError() {
 		log.Fatalf("Cannot create index: %s", res)
 	}
+
+	if count%batch == 0 {
+		numBatches = (count / batch)
+	} else {
+		numBatches = (count / batch) + 1
+	}
+
+	start := time.Now().UTC()
 
 	// Start looping over collection
 	//
@@ -149,7 +170,7 @@ func main() {
 		// When a threshold is reached, execute the Bulk() request with body from buffer
 		//
 		if i > 0 && i%batch == 0 || i == count-1 {
-			log.Printf("> Batch %-2d of %d", currBatch, (count/batch)+1)
+			log.Printf("> Batch %-2d of %d", currBatch, numBatches)
 
 			res, err = es.Bulk(bytes.NewReader(buf.Bytes()), es.Bulk.WithIndex(indexName))
 			if err != nil {
@@ -197,10 +218,23 @@ func main() {
 
 	log.Println(strings.Repeat("=", 80))
 
+	dur := time.Since(start)
+
 	// Report results: number of indexed docs, number of errors, duration
 	if numErrors > 0 {
-		log.Fatalf("Indexed [%d] documents, failed [%d]\n\n", numIndexed, numErrors)
+		log.Fatalf(
+			"Indexed [%d] documents with [%d] errors in %s (%.0f docs/sec)",
+			numIndexed,
+			numErrors,
+			dur.Truncate(time.Millisecond),
+			1000.0/float64(int64(dur)/int64(time.Millisecond))*float64(numIndexed),
+		)
 	} else {
-		log.Printf("Sucessfuly indexed [%d] documents", numIndexed)
+		log.Printf(
+			"Sucessfuly indexed [%d] documents in %s (%.0f docs/sec)",
+			numIndexed,
+			dur.Truncate(time.Millisecond),
+			1000.0/float64(int64(dur)/int64(time.Millisecond))*float64(numIndexed),
+		)
 	}
 }

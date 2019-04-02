@@ -111,7 +111,7 @@ func main() {
 			ID:        i,
 			Title:     strings.Join([]string{"Title", strconv.Itoa(i)}, " "),
 			Body:      "Lorem ipsum dolor sit amet...",
-			Published: time.Now().Round(time.Millisecond).UTC().AddDate(0, 0, i),
+			Published: time.Now().Round(time.Second).UTC().AddDate(0, 0, i),
 			Author: Author{
 				FirstName: names[rand.Intn(len(names))],
 				LastName:  "Smith",
